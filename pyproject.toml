@@ -9,3 +9,11 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[dependency-groups]
+dev = [
+    "anyio>=4.15.1",
+    "pyflakes>=3.4.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]

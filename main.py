@@ -22,12 +22,24 @@ from jobqueue import (
     SQLiteStore,
     WorkerPool,
 )
-from jobqueue.models import Job
+from jobqueue.models import Job, JobEvent
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
 DB_PATH = os.environ.get("JOBQUEUE_DB", "jobqueue.db")
+
+
+def event_view(ev: JobEvent) -> dict[str, Any]:
+    """审计视图: 只暴露变化类型/尝试次数/归一化原因, 不含载荷与堆栈。"""
+    return {
+        "id": ev.id,
+        "job_id": ev.job_id,
+        "event": ev.event.value,
+        "attempt": ev.attempt,
+        "reason": ev.reason,
+        "created_at": ev.created_at,
+    }
 
 
 def job_view(job: Job) -> dict[str, Any]:
@@ -66,12 +78,27 @@ async def demo_handler(payload: dict[str, Any]) -> Any:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store = SQLiteStore(DB_PATH)
-    queue = JobQueue(store, capacity=int(os.environ.get("JOBQUEUE_CAPACITY", "1000")),
-                     backoff=BackoffPolicy())
+    queue = JobQueue(
+        store,
+        capacity=int(os.environ.get("JOBQUEUE_CAPACITY", "1000")),
+        backoff=BackoffPolicy(),
+        lease_seconds=float(os.environ.get("JOBQUEUE_LEASE_SECONDS", "30")),
+        stale_lease_seconds=float(
+            os.environ.get("JOBQUEUE_STALE_LEASE_SECONDS",
+                           os.environ.get("JOBQUEUE_LEASE_SECONDS", "30"))
+        ),
+        startup_reclaim_all=os.environ.get(
+            "JOBQUEUE_STARTUP_RECLAIM_ALL", "1"
+        ) not in ("0", "false", "False", ""),
+    )
+    # 默认配置下正常启动流程即自愈: 回收上次进程留下的全部执行中任务。
     recovered = queue.recover()
     if recovered:
         logger.info("recovered %d leased jobs after restart", len(recovered))
-    pool = WorkerPool(queue, demo_handler, concurrency=4)
+    pool = WorkerPool(
+        queue, demo_handler, concurrency=4,
+        reap_interval=float(os.environ.get("JOBQUEUE_REAP_INTERVAL", "1")),
+    )
     await pool.start()
     app.state.queue = queue
     app.state.pool = pool
@@ -132,3 +159,24 @@ def list_dead(request: Request) -> list[dict[str, Any]]:
 @app.post("/jobs/{job_id}/replay")
 def replay_job(job_id: str, request: Request) -> dict[str, Any]:
     return job_view(request.app.state.queue.replay(job_id))
+
+
+@app.get("/jobs/{job_id}/events")
+def get_job_events(job_id: str, request: Request) -> list[dict[str, Any]]:
+    # 任务不存在时返回空列表(审计能力不泄露任务存在性之外的内部信息);
+    # 调用方可先经 GET /jobs/{id} 确认任务。
+    queue: JobQueue = request.app.state.queue
+    queue.get(job_id)  # 不存在则抛 JobNotFound -> 404
+    return [event_view(e) for e in queue.events(job_id)]
+
+
+@app.get("/events")
+def list_events(request: Request, since_id: int = 0, limit: int = 200) -> dict[str, Any]:
+    """全局增量审计查询: 返回 id > since_id、按 id(时间顺序) 排列的记录。"""
+    limit = max(1, min(limit, 1000))
+    queue: JobQueue = request.app.state.queue
+    events = queue.events_since(since_id, limit)
+    return {
+        "events": [event_view(e) for e in events],
+        "next_since_id": events[-1].id if events else since_id,
+    }

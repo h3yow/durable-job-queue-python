@@ -32,6 +32,36 @@ class JobState(str, enum.Enum):
 TERMINAL_STATES = frozenset({JobState.SUCCEEDED, JobState.CANCELLED})
 
 
+class EventType(str, enum.Enum):
+    """生命周期审计事件类型, 只记录可公开的变化类别。
+
+    审计记录按 append-only 方式落库, 只含变化类型/尝试次数/归一化原因,
+    不含载荷与内部异常堆栈。
+    """
+
+    SUBMITTED = "submitted"                # 提交受理
+    CLAIMED = "claimed"                    # 被执行者领取(进入一次尝试)
+    SUCCEEDED = "succeeded"                # 执行成功落终态
+    RETRY_SCHEDULED = "retry_scheduled"    # 失败后排期重试
+    DEAD_LETTERED = "dead_lettered"        # 重试耗尽进入死信
+    CANCEL_REQUESTED = "cancel_requested"  # 执行中取消被受理(收口前)
+    CANCELLED = "cancelled"                # 取消收口为终态
+    REPLAYED = "replayed"                  # 死信人工重放
+    LEASE_RECLAIMED = "lease_reclaimed"    # 自愈: 失联租约被收回
+
+
+@dataclass
+class JobEvent:
+    """一条 append-only 的生命周期审计记录。"""
+
+    id: int
+    job_id: str
+    event: EventType
+    attempt: int
+    reason: str | None
+    created_at: float
+
+
 class FailureKind(str, enum.Enum):
     """归一化后的失败类型, 对外只暴露这些可区分的类别。"""
 

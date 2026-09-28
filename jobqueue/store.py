@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import uuid
 
-from jobqueue.models import FailureKind, FailureRecord, Job, JobState
+from jobqueue.models import EventType, FailureKind, FailureRecord, Job, JobEvent, JobState
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -36,6 +36,28 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_state_runat ON jobs(state, run_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_lease_expiry ON jobs(state, lease_expires_at);
+
+-- 生命周期审计: append-only, 只存变化类型/尝试次数/归一化原因,
+-- 不存载荷与内部异常堆栈; 触发器禁止更新与删除, 历史不可改写。
+CREATE TABLE IF NOT EXISTS job_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      TEXT NOT NULL,
+    event       TEXT NOT NULL,
+    attempt     INTEGER NOT NULL,
+    reason      TEXT,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id, id);
+CREATE TRIGGER IF NOT EXISTS job_events_no_update
+BEFORE UPDATE ON job_events
+BEGIN
+    SELECT RAISE(ABORT, 'job_events is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS job_events_no_delete
+BEFORE DELETE ON job_events
+BEGIN
+    SELECT RAISE(ABORT, 'job_events is append-only');
+END;
 """
 
 
@@ -98,6 +120,48 @@ class SQLiteStore:
         )
 
     # ------------------------------------------------------------------
+    # 生命周期审计 (append-only)
+    # ------------------------------------------------------------------
+    def _append_event(
+        self,
+        conn: sqlite3.Connection,
+        job_id: str,
+        event: EventType,
+        attempt: int,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO job_events (job_id, event, attempt, reason, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (job_id, event.value, attempt, reason, now if now is not None else Job.now()),
+        )
+
+    @staticmethod
+    def _event_from_row(row: sqlite3.Row) -> JobEvent:
+        return JobEvent(
+            id=row["id"], job_id=row["job_id"], event=EventType(row["event"]),
+            attempt=row["attempt"], reason=row["reason"], created_at=row["created_at"],
+        )
+
+    def list_events(self, job_id: str) -> list[JobEvent]:
+        """按时间顺序返回单个任务的审计记录; 不存在的任务返回空列表。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM job_events WHERE job_id = ? ORDER BY id", (job_id,)
+            ).fetchall()
+        return [self._event_from_row(r) for r in rows]
+
+    def list_events_since(self, event_id: int, limit: int = 200) -> list[JobEvent]:
+        """全局增量查询: 返回 id > event_id 的审计记录(按时间顺序), 用于排障。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM job_events WHERE id > ? ORDER BY id LIMIT ?""",
+                (event_id, limit),
+            ).fetchall()
+        return [self._event_from_row(r) for r in rows]
+
+    # ------------------------------------------------------------------
     # 写入
     # ------------------------------------------------------------------
     def insert_job(self, job: Job, payload_hash: str) -> None:
@@ -119,6 +183,9 @@ class SQLiteStore:
                     json.dumps(job.result) if job.result is not None else None,
                     job.created_at, job.updated_at,
                 ),
+            )
+            self._append_event(
+                self._conn, job.id, EventType.SUBMITTED, 0, None, job.created_at
             )
 
     def get_job(self, job_id: str) -> Job | None:
@@ -176,7 +243,11 @@ class SQLiteStore:
             )
             if cur.rowcount != 1:
                 return None
-            return self.get_job(row["id"])
+            claimed = self.get_job(row["id"])
+            self._append_event(
+                self._conn, row["id"], EventType.CLAIMED, claimed.attempts, None, now
+            )
+            return claimed
 
     def complete(self, job_id: str, lease_token: str, result: object) -> bool:
         """仅当租约仍由该执行者持有时置为成功。"""
@@ -189,19 +260,33 @@ class SQLiteStore:
                 (JobState.SUCCEEDED.value, json.dumps(result), now,
                  job_id, JobState.LEASED.value, lease_token),
             )
+            if cur.rowcount == 1:
+                self._append_event(
+                    self._conn, job_id, EventType.SUCCEEDED,
+                    self._attempts_of(self._conn, job_id), None, now,
+                )
             return cur.rowcount == 1
+
+    @staticmethod
+    def _attempts_of(conn: sqlite3.Connection, job_id: str) -> int:
+        row = conn.execute(
+            "SELECT attempts FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return int(row["attempts"]) if row else 0
 
     def fail(self, job: Job) -> bool:
         """失败落库: 重排(PENDING)或死信(DEAD), 追加失败历史。
 
-        仅当租约匹配时生效, 防止过期租约的执行者覆盖新状态。
+        仅当租约匹配且取消标记未置位时生效: 若取消恰好在失败落库前到达,
+        返回 False, 由调用方改走取消收口, 防止结果被改回重试/死信。
         """
         with self._lock, self._conn:
             cur = self._conn.execute(
                 """UPDATE jobs SET state = ?, run_at = ?, lease_token = NULL,
                        lease_expires_at = NULL, last_failure = ?,
                        failure_history = ?, updated_at = ?
-                   WHERE id = ? AND state = ? AND lease_token = ?""",
+                   WHERE id = ? AND state = ? AND lease_token = ?
+                         AND cancel_requested = 0""",
                 (
                     job.state.value, job.run_at,
                     self._failure_to_json(job.last_failure),
@@ -209,10 +294,22 @@ class SQLiteStore:
                     job.updated_at, job.id, JobState.LEASED.value, job.lease_token,
                 ),
             )
+            if cur.rowcount == 1 and job.last_failure is not None:
+                event = (
+                    EventType.DEAD_LETTERED
+                    if job.state == JobState.DEAD
+                    else EventType.RETRY_SCHEDULED
+                )
+                reason = f"{job.last_failure.kind.value}: {job.last_failure.reason}"
+                self._append_event(
+                    self._conn, job.id, event, job.attempts, reason, job.updated_at
+                )
             return cur.rowcount == 1
 
-    def complete_cancel(self, job_id: str, lease_token: str) -> bool:
-        """已领取任务被取消后, 由执行者落终态。"""
+    def complete_cancel(
+        self, job_id: str, lease_token: str, reason: str = "cancel accepted during execution"
+    ) -> bool:
+        """已领取任务被取消后, 由执行者或自愈流程落终态。"""
         now = Job.now()
         with self._lock, self._conn:
             cur = self._conn.execute(
@@ -222,35 +319,52 @@ class SQLiteStore:
                 (JobState.CANCELLED.value, now, job_id,
                  JobState.LEASED.value, lease_token),
             )
+            if cur.rowcount == 1:
+                self._append_event(
+                    self._conn, job_id, EventType.CANCELLED,
+                    self._attempts_of(self._conn, job_id), reason, now,
+                )
             return cur.rowcount == 1
 
     def cancel(self, job_id: str) -> Job | None:
         """取消入口, 幂等。
 
         - PENDING  -> CANCELLED (立即生效)
-        - LEASED   -> 仅置 cancel_requested 标记, 由执行者中断后落终态
-        - 其他状态 -> 不变, 重复取消不报错
+        - LEASED   -> 仅置 cancel_requested 标记, 由执行者中断后落终态;
+                      标记已是 1 时重复受理不再追加审计记录
+        - 终态/DEAD-> 不变, 重复取消不报错、不追加记录
         """
         now = Job.now()
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT state FROM jobs WHERE id = ?", (job_id,)
+                "SELECT state, attempts, cancel_requested FROM jobs WHERE id = ?",
+                (job_id,),
             ).fetchone()
             if row is None:
                 return None
             state = JobState(row["state"])
             if state == JobState.PENDING:
-                self._conn.execute(
+                cur = self._conn.execute(
                     """UPDATE jobs SET state = ?, run_at = 0, updated_at = ?
                        WHERE id = ? AND state = ?""",
                     (JobState.CANCELLED.value, now, job_id, JobState.PENDING.value),
                 )
-            elif state == JobState.LEASED:
-                self._conn.execute(
+                if cur.rowcount == 1:
+                    self._append_event(
+                        self._conn, job_id, EventType.CANCELLED,
+                        row["attempts"], "cancelled while queued", now,
+                    )
+            elif state == JobState.LEASED and not row["cancel_requested"]:
+                cur = self._conn.execute(
                     """UPDATE jobs SET cancel_requested = 1, updated_at = ?
-                       WHERE id = ? AND state = ?""",
+                       WHERE id = ? AND state = ? AND cancel_requested = 0""",
                     (now, job_id, JobState.LEASED.value),
                 )
+                if cur.rowcount == 1:
+                    self._append_event(
+                        self._conn, job_id, EventType.CANCEL_REQUESTED,
+                        row["attempts"], "cancel accepted while leased", now,
+                    )
             return self.get_job(job_id)
 
     def replay(self, job_id: str) -> Job | None:
@@ -266,30 +380,81 @@ class SQLiteStore:
             )
             if cur.rowcount != 1:
                 return None
-            return self.get_job(job_id)
+            replayed = self.get_job(job_id)
+            self._append_event(
+                self._conn, job_id, EventType.REPLAYED, replayed.attempts,
+                "manual replay from dead letter", now,
+            )
+            return replayed
 
-    def requeue_expired_leases(self, now: float) -> list[Job]:
-        """崩溃恢复: 租约过期的执行中任务回到排队, 不静默丢弃。"""
+    def reclaim_leases(self, now: float, *, only_expired: bool, reason: str) -> list[Job]:
+        """自愈收回执行中任务。
+
+        only_expired=True  (运行期失联扫描): 仅收回 lease_expires_at <= now
+                           的租约, 且不再重置 run_at(保留原排期, 立刻可领)。
+        only_expired=False (启动恢复, 默认配置): 回收全部 LEASED 租约——
+                           旧进程已经消失, 不必等租约到期, 任务不会长期
+                           停在执行中。
+
+        已置 cancel_requested 的任务直接收口为 CANCELLED(不再执行);
+        其余回到 PENDING。迁移带 state=LEASED 前置条件, 重复扫描或旧执行
+        者晚到都不会造成二次执行; attempts 不回退也不增加。
+        """
         with self._lock, self._conn:
-            rows = self._conn.execute(
-                """SELECT id FROM jobs
-                   WHERE state = ? AND lease_expires_at IS NOT NULL
-                         AND lease_expires_at <= ?""",
-                (JobState.LEASED.value, now),
-            ).fetchall()
-            requeued: list[Job] = []
+            if only_expired:
+                rows = self._conn.execute(
+                    """SELECT id FROM jobs
+                       WHERE state = ? AND lease_expires_at IS NOT NULL
+                             AND lease_expires_at <= ?""",
+                    (JobState.LEASED.value, now),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT id FROM jobs WHERE state = ?",
+                    (JobState.LEASED.value,),
+                ).fetchall()
+            reclaimed: list[Job] = []
             for row in rows:
-                cur = self._conn.execute(
-                    """UPDATE jobs SET state = ?, lease_token = NULL,
-                           lease_expires_at = NULL, updated_at = ?
+                meta = self._conn.execute(
+                    """SELECT attempts, cancel_requested, lease_token FROM jobs
                        WHERE id = ? AND state = ?""",
-                    (JobState.PENDING.value, now, row["id"], JobState.LEASED.value),
-                )
-                if cur.rowcount == 1:
-                    job = self.get_job(row["id"])
-                    if job is not None:
-                        requeued.append(job)
-            return requeued
+                    (row["id"], JobState.LEASED.value),
+                ).fetchone()
+                if meta is None:
+                    continue
+                if meta["cancel_requested"]:
+                    cur = self._conn.execute(
+                        """UPDATE jobs SET state = ?, lease_token = NULL,
+                               lease_expires_at = NULL, updated_at = ?
+                           WHERE id = ? AND state = ?""",
+                        (JobState.CANCELLED.value, now, row["id"],
+                         JobState.LEASED.value),
+                    )
+                    if cur.rowcount == 1:
+                        self._append_event(
+                            self._conn, row["id"], EventType.CANCELLED,
+                            meta["attempts"],
+                            f"{reason}; cancel requested, settled without re-run", now,
+                        )
+                else:
+                    cur = self._conn.execute(
+                        """UPDATE jobs SET state = ?, lease_token = NULL,
+                               lease_expires_at = NULL, updated_at = ?
+                           WHERE id = ? AND state = ?""",
+                        (JobState.PENDING.value, now, row["id"],
+                         JobState.LEASED.value),
+                    )
+                    if cur.rowcount == 1:
+                        self._append_event(
+                            self._conn, row["id"], EventType.LEASE_RECLAIMED,
+                            meta["attempts"], reason, now,
+                        )
+                job = self.get_job(row["id"])
+                if job is not None and job.state in (
+                    JobState.PENDING, JobState.CANCELLED
+                ):
+                    reclaimed.append(job)
+            return reclaimed
 
     def list_dead(self) -> list[Job]:
         with self._lock:

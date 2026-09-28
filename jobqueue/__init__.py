@@ -6,13 +6,17 @@ from jobqueue.errors import (
     JobQueueError,
     QueueFull,
 )
-from jobqueue.models import FailureKind, Job, JobState
+from jobqueue.models import AuditEvent, CancelEffect, CancelResult, EventType, FailureKind, Job, JobState
 from jobqueue.service import JobQueue
 from jobqueue.store import SQLiteStore
 from jobqueue.worker import WorkerPool
 
 __all__ = [
+    "AuditEvent",
     "BackoffPolicy",
+    "CancelEffect",
+    "CancelResult",
+    "EventType",
     "FailureKind",
     "IdempotencyConflict",
     "InvalidStateTransition",

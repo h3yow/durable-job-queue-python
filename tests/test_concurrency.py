@@ -70,11 +70,12 @@ def test_cancel_leased_job_interrupts_execution(queue):
         await asyncio.wait_for(started.wait(), 2)
         cancelled = queue.cancel(job.id)
         logger.info(
-            "状态迁移: job=%s leased(cancel_requested=%s), 等待执行者落终态",
-            cancelled.id, cancelled.cancel_requested,
+            "状态迁移: job=%s leased(cancel_requested=%s) effect=%s, 等待执行者落终态",
+            cancelled.job.id, cancelled.job.cancel_requested, cancelled.effect.value,
         )
-        assert cancelled.state == JobState.LEASED
-        assert cancelled.cancel_requested
+        assert cancelled.job.state == JobState.LEASED
+        assert cancelled.job.cancel_requested
+        assert cancelled.effect.value == "accepted"
         ok = await wait_for(lambda: queue.get(job.id).state == JobState.CANCELLED)
         await pool.stop()
         return job, ok
@@ -86,7 +87,8 @@ def test_cancel_leased_job_interrupts_execution(queue):
     assert final.state == JobState.CANCELLED
     # 重复取消不改变终态
     again = queue.cancel(job.id)
-    assert again.state == JobState.CANCELLED
+    assert again.job.state == JobState.CANCELLED
+    assert again.effect.value == "cancelled"
 
 
 def test_cancel_race_with_completion_is_consistent(queue):

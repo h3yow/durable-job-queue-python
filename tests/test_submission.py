@@ -45,12 +45,16 @@ def test_backpressure_queue_full(db_path):
 
 def test_cancel_pending_job_is_terminal_and_idempotent(queue):
     job = queue.submit({"n": 1})
-    c1 = queue.cancel(job.id)
-    logger.info("状态迁移: job=%s pending->%s", job.id, c1.state.value)
-    assert c1.state == JobState.CANCELLED
-    c2 = queue.cancel(job.id)
-    logger.info("判定依据: 重复取消终态任务 -> 仍 %s, 不报错", c2.state.value)
-    assert c2.state == JobState.CANCELLED
+    r1 = queue.cancel(job.id)
+    logger.info("状态迁移: job=%s pending->%s effect=%s",
+                job.id, r1.job.state.value, r1.effect.value)
+    assert r1.job.state == JobState.CANCELLED
+    assert r1.effect.value == "cancelled"
+    r2 = queue.cancel(job.id)
+    logger.info("判定依据: 重复取消终态任务 -> 仍 %s effect=%s, 不报错",
+                r2.job.state.value, r2.effect.value)
+    assert r2.job.state == JobState.CANCELLED
+    assert r2.effect.value == "cancelled"
 
 
 def test_cancel_unknown_job_raises(queue):

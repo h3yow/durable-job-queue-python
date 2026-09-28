@@ -13,7 +13,14 @@ from jobqueue.errors import (
     JobNotFound,
     QueueFull,
 )
-from jobqueue.models import Job, JobState
+from jobqueue.models import (
+    AuditEvent,
+    CancelEffect,
+    CancelResult,
+    EventType,
+    Job,
+    JobState,
+)
 from jobqueue.store import SQLiteStore
 
 logger = logging.getLogger("jobqueue.service")
@@ -33,11 +40,17 @@ class JobQueue:
         capacity: int = 1000,
         backoff: BackoffPolicy | None = None,
         lease_seconds: float = 30.0,
+        stale_timeout_seconds: float | None = None,
     ) -> None:
         self._store = store
         self._capacity = capacity
         self._backoff = backoff or BackoffPolicy()
         self._lease_seconds = lease_seconds
+        # 运行期失联判定阈值, 默认等于一个租约周期; 调小可快速复现收回。
+        self._stale_timeout_seconds = (
+            stale_timeout_seconds if stale_timeout_seconds is not None
+            else lease_seconds
+        )
 
     @property
     def backoff(self) -> BackoffPolicy:
@@ -48,25 +61,57 @@ class JobQueue:
         return self._lease_seconds
 
     @property
+    def stale_timeout_seconds(self) -> float:
+        return self._stale_timeout_seconds
+
+    @property
     def store(self) -> SQLiteStore:
         return self._store
 
     # ------------------------------------------------------------------
-    # 恢复
+    # 自愈: 启动恢复 + 运行期失联扫描
     # ------------------------------------------------------------------
     def recover(self) -> list[Job]:
-        """进程重启恢复: 回收过期租约, 执行中的任务重新排队而非丢弃。
+        """启动恢复(默认配置随正常启动流程调用)。
 
-        租约尚未过期的任务保持 LEASED, 由后续周期性的 recover 在其
-        过期后回收; 旧执行者即使存活, 其租约 token 已无法再通过
-        条件更新, 因此不会造成重复生效的写。
+        上次进程残留的全部 LEASED 任务立即收回: 未受理取消的回到
+        PENDING 立即可再次执行, 已受理取消的直接收口 CANCELLED。
+        不要求先等租约过期, 避免任务在默认配置下长期停在执行中。
+        attempts 不增加, 旧租约 token 立即失效。
         """
-        requeued = self._store.requeue_expired_leases(Job.now())
-        for job in requeued:
-            logger.info(
-                "recover: job=%s leased->pending attempts=%d (lease expired)",
-                job.id, job.attempts,
-            )
+        return self._reclaim(
+            only_expired=False, reason="startup recovery: previous lease abandoned"
+        )
+
+    def reclaim_stale(self) -> list[Job]:
+        """运行期失联扫描: 收回超过 stale_timeout_seconds 无进展的任务。
+
+        判定依据是领取时写入的 lease_expires_at, 阈值可配置;
+        重复扫描是幂等的(条件迁移, 已不在 LEASED 的行不会再动)。
+        """
+        return self._reclaim(
+            only_expired=True,
+            reason=f"runtime reclaim: no progress for {self._stale_timeout_seconds}s",
+        )
+
+    def _reclaim(self, *, only_expired: bool, reason: str) -> list[Job]:
+        now = Job.now()
+        results = self._store.reclaim_leased_jobs(
+            now, only_expired=only_expired, reason=reason
+        )
+        requeued: list[Job] = []
+        for job, event, why in results:
+            if event == EventType.CANCELLED:
+                logger.info(
+                    "reclaim: job=%s leased->cancelled attempts=%d (%s)",
+                    job.id, job.attempts, why,
+                )
+            else:
+                logger.info(
+                    "reclaim: job=%s leased->pending attempts=%d (%s)",
+                    job.id, job.attempts, why,
+                )
+            requeued.append(job)
         return requeued
 
     # ------------------------------------------------------------------
@@ -126,17 +171,27 @@ class JobQueue:
             raise JobNotFound(job_id)
         return job
 
-    def cancel(self, job_id: str) -> Job:
-        """取消, 幂等: 排队中立即取消; 已领取的置取消标记由执行者中断;
-        已到达终态的重复取消不报错也不改变结果。"""
-        job = self._store.cancel(job_id)
+    def cancel(self, job_id: str) -> CancelResult:
+        """取消, 幂等, 返回语义区分排队中与执行中:
+
+        - PENDING -> 立即 CANCELLED, effect=CANCELLED
+        - LEASED  -> 置取消标记, effect=ACCEPTED, 由执行者/自愈收口
+        - 已在终态 -> 原样返回, effect=CANCELLED, 不报错不改写结果
+        并发重复取消执行中任务只有第一次受理落审计, 其余幂等返回。
+        """
+        job, event = self._store.cancel(job_id)
         if job is None:
             raise JobNotFound(job_id)
+        if event == EventType.CANCEL_REQUESTED:
+            effect = CancelEffect.ACCEPTED
+        else:
+            # PENDING 首次取消、终态重复取消都归为"此刻已是取消终态语义"
+            effect = CancelEffect.CANCELLED
         logger.info(
-            "cancel: job=%s state=%s cancel_requested=%s",
-            job.id, job.state.value, job.cancel_requested,
+            "cancel: job=%s state=%s effect=%s cancel_requested=%s",
+            job.id, job.state.value, effect.value, job.cancel_requested,
         )
-        return job
+        return CancelResult(job=job, effect=effect)
 
     def replay(self, job_id: str) -> Job:
         """人工重放死信任务, 原始失败原因保留在 failure_history。"""
@@ -157,3 +212,16 @@ class JobQueue:
 
     def list_dead(self) -> list[Job]:
         return self._store.list_dead()
+
+    # ------------------------------------------------------------------
+    # 生命周期审计查询
+    # ------------------------------------------------------------------
+    def get_events(self, job_id: str) -> list[AuditEvent]:
+        """单任务按时间顺序的关键变化记录; 不存在的任务抛 JobNotFound。"""
+        if self._store.get_job(job_id) is None:
+            raise JobNotFound(job_id)
+        return self._store.list_events(job_id)
+
+    def list_events(self, *, after_id: int = 0, limit: int = 500) -> list[AuditEvent]:
+        """全局按时间顺序翻页查询审计记录 (id > after_id)。"""
+        return self._store.list_events_since(after_id, limit)

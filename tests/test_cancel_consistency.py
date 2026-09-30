@@ -143,6 +143,15 @@ def test_cancel_race_at_completion_boundary(queue):
         assert fresh.state in (JobState.SUCCEEDED, JobState.CANCELLED)
         if fresh.state == JobState.CANCELLED:
             assert fresh.result is None
+        # 不变量: 取消一旦受理(存在 cancel_requested 审计), 终态只能是已取消,
+        # 受理之后不允许再出现成功/重试/死信记录。
+        events = queue.events(j.id)
+        kinds = [e.event for e in events]
+        if EventType.CANCEL_REQUESTED in kinds:
+            assert fresh.state == JobState.CANCELLED
+            assert fresh.result is None
+            tail = kinds[kinds.index(EventType.CANCEL_REQUESTED) + 1:]
+            assert tail == [EventType.CANCELLED], (j.id, kinds)
     logger.info(
         "判定依据: 100 个完成边界竞态终态分布=%s, 无 active 残留",
         {s.value: n for s, n in states.items()},

@@ -250,13 +250,19 @@ class SQLiteStore:
             return claimed
 
     def complete(self, job_id: str, lease_token: str, result: object) -> bool:
-        """仅当租约仍由该执行者持有时置为成功。"""
+        """仅当租约仍由该执行者持有、且取消未被受理时置为成功。
+
+        cancel_requested=0 与租约校验同属一条条件 UPDATE: 取消受理与完成
+        落库即使在同一时刻发生, 也只有一方生效。取消一旦受理, 成功写入
+        直接被拒, 由调用方改走取消收口, 结果不会被保留为成功。
+        """
         now = Job.now()
         with self._lock, self._conn:
             cur = self._conn.execute(
                 """UPDATE jobs SET state = ?, result = ?, lease_token = NULL,
                        lease_expires_at = NULL, updated_at = ?
-                   WHERE id = ? AND state = ? AND lease_token = ?""",
+                   WHERE id = ? AND state = ? AND lease_token = ?
+                         AND cancel_requested = 0""",
                 (JobState.SUCCEEDED.value, json.dumps(result), now,
                  job_id, JobState.LEASED.value, lease_token),
             )
@@ -309,11 +315,18 @@ class SQLiteStore:
     def complete_cancel(
         self, job_id: str, lease_token: str, reason: str = "cancel accepted during execution"
     ) -> bool:
-        """已领取任务被取消后, 由执行者或自愈流程落终态。"""
+        """已领取任务被取消后, 由执行者或自愈流程落终态。
+
+        收口时显式清空 result: CANCELLED 终态不得保留处理器返回值。
+        此前各次失败尝试留下的 last_failure/failure_history 属于历史记录
+        (与 append-only 审计一致), 不在此处抹除; 本次尝试的失败因 fail()
+        被 cancel_requested 守卫拒绝, 本来就不会落库。仅当租约仍持有时
+        生效, 晚到的旧执行者无法改写。
+        """
         now = Job.now()
         with self._lock, self._conn:
             cur = self._conn.execute(
-                """UPDATE jobs SET state = ?, lease_token = NULL,
+                """UPDATE jobs SET state = ?, result = NULL, lease_token = NULL,
                        lease_expires_at = NULL, updated_at = ?
                    WHERE id = ? AND state = ? AND lease_token = ?""",
                 (JobState.CANCELLED.value, now, job_id,
@@ -424,7 +437,7 @@ class SQLiteStore:
                     continue
                 if meta["cancel_requested"]:
                     cur = self._conn.execute(
-                        """UPDATE jobs SET state = ?, lease_token = NULL,
+                        """UPDATE jobs SET state = ?, result = NULL, lease_token = NULL,
                                lease_expires_at = NULL, updated_at = ?
                            WHERE id = ? AND state = ?""",
                         (JobState.CANCELLED.value, now, row["id"],

@@ -14,12 +14,20 @@ class JobState(str, enum.Enum):
     合法迁移:
         PENDING   -> LEASED      (工作协程领取)
         PENDING   -> CANCELLED   (取消排队中的任务)
-        LEASED    -> SUCCEEDED   (执行成功)
+        LEASED    -> SUCCEEDED   (执行成功, 仅当取消未被受理)
         LEASED    -> PENDING     (失败重试, 延迟重排 / 崩溃恢复)
         LEASED    -> DEAD        (重试耗尽进入死信)
         LEASED    -> CANCELLED   (取消已领取的任务, 执行被中断)
         DEAD      -> PENDING     (人工重放, 保留历史失败原因)
     终态: SUCCEEDED / CANCELLED; DEAD 仅可经人工重放离开。
+
+    取消收口不变量: 执行中的任务一旦受理取消(置 cancel_requested 标记,
+    审计记 cancel_requested), 无论处理器随后正常返回、抛异常还是超时,
+    最终都只能迁移到 CANCELLED: 成功/失败落库的条件 SQL 均带
+    cancel_requested=0 前置条件, 被拒后由执行者改走取消收口; 进程失联
+    时由自愈扫描直接收口。终态不会改回 SUCCEEDED, 不会重排重试或进死信,
+    attempts 不增不退, 处理器返回值一律清空(此前重试留下的历史失败
+    记录保留, 本次尝试的失败不会落库)。
     """
 
     PENDING = "pending"

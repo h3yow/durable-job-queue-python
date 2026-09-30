@@ -15,7 +15,7 @@ jobqueue/
   store.py            SQLiteStore: 条件化状态迁移 + append-only 审计, 杜绝半更新/状态越位
   service.py          JobQueue: 幂等提交、背压、取消、重放、启动自愈与运行期收回
   worker.py           WorkerPool: 并发领取、超时中断、失败归一化、周期失联收回
-tests/                并发领取/重复提交/重试耗尽/取消竞态/重启恢复/自愈/取消终态/审计
+tests/                并发领取/重复提交/重试耗尽/取消竞态/完成边界确定性复现/重启恢复/自愈/取消终态/审计
 ```
 
 ## 任务状态机
@@ -35,9 +35,18 @@ DEAD    --人工重放--> PENDING (attempts 归零, 失败历史保留)
 - 取消语义可从返回值区分: 排队中的任务立即置 `CANCELLED`(返回
   `state=cancelled, cancel_requested=false`); 已领取的任务先返回
   `state=leased, cancel_requested=true` 表示"取消已受理", 随后始终收口
-  为 `CANCELLED`——无论处理器紧接着成功、抛错还是超时, 也无论取消是否
-  正好卡在完成/失败落库的边界: 条件 SQL(`AND cancel_requested=0`)保证
-  成功与取消只有一方生效, 不会改回成功、重试待执行或再次领取执行。
+  为 `CANCELLED`。
+- **取消受理后必定收口为已取消(核心不变量)**: 执行中的任务一旦受理取消,
+  无论处理器紧接着正常返回、抛异常还是超时, 终态只能是 `CANCELLED`——
+  不会改回 `SUCCEEDED`、不会保留处理器返回值(收口 SQL 显式置
+  `result=NULL`; 本次尝试的失败因写入被守卫拒绝而不会落库, 此前各次
+  重试留下的历史失败记录保留)、不会重排重试或进入死信, `attempts`
+  不增加也不回退。成功落库(`complete`)与失败落库(`fail`)的条件 UPDATE
+  都带 `AND cancel_requested=0` 前置条件, 取消与"执行刚好结束"卡在同一
+  时间点时由 SQL 原子判定只有一方生效: 被拒的一方检测到取消标记后改走
+  `complete_cancel` 收口; 执行者若已失联, 则由自愈扫描带取消标记直接
+  收口。取消受理(`cancel_requested`)之后的审计记录只可能是一条
+  `cancelled`, 不可能再出现 `succeeded`/`retry_scheduled`/`dead_lettered`。
 - 并发重复取消、对终态(`SUCCEEDED`/`CANCELLED`)或 `DEAD` 的取消都是
   幂等的: 不报错、不改变已有结果、不重复追加审计记录。
 - 所有迁移都是带前置条件的单条 SQL(`WHERE state=? AND lease_token=?`),
@@ -161,6 +170,28 @@ uv run pytest tests/ -q
 - `test_cancel_consistency.py`  取消对成功/异常/超时/完成边界竞态始终
   收口 CANCELLED、并发重复取消只受理一次、终态取消无副作用、
   排队/执行中返回语义可区分
+- `test_cancel_boundary_race.py`  完成边界竞态的**确定性**复现:
+  `RaceWindowStore`(仅测试用的存储子类)在 `complete`/`fail` 落库 SQL
+  执行前的接缝点上, 从其它真实线程并发发起取消, 分别覆盖处理器成功、
+  抛异常、超时三种情况, 以及 40 任务/8 协程/每任务 4 线程重复取消的
+  真实并发压力; 断言"取消一旦受理, 终态只能是 CANCELLED、结果为
+  NULL、attempts 不增不退、审计尾部只能是一条 cancelled"。另含两条
+  存储层原子性用例, 直接断言取消受理后 `complete`/`fail` 写入被拒。
+
+### 复现"取消受理后被改回成功"的缺陷并验证修复
+
+历史缺陷: 执行者成功路径曾是"先 `get_job()` 检查标记、再 `complete()`
+落成功"两步操作, 而 `complete()` 的条件 SQL 只校验 `state/lease_token`,
+未校验 `cancel_requested`; 取消若恰好在两步之间被受理, 任务仍会落为
+`SUCCEEDED` 并带出处理器结果(审计上表现为 `cancel_requested` 后又跟
+一条 `succeeded`)。本地可这样复现修复前后的差异:
+
+```bash
+uv run pytest tests/test_cancel_boundary_race.py -q   # 修复后: 6 passed
+# 临时去掉 store.complete() SQL 里的 "AND cancel_requested = 0" 后再跑:
+# -> 3 failed (存储层成功写入 / 成功边界 / 真实并发), 日志可见
+#    cancel_requested=True 之后紧接 leased->succeeded
+```
 - `test_audit.py`  完整生命周期事件序列、重启不丢、历史不被后续操作
   改写、触发器禁止 UPDATE/DELETE、不泄露载荷与堆栈、全局增量有序翻页
 

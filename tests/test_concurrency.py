@@ -4,7 +4,7 @@ import logging
 import time
 from collections import Counter
 
-from jobqueue import JobState, WorkerPool
+from jobqueue import EventType, JobState, WorkerPool
 
 logger = logging.getLogger("test.concurrency")
 
@@ -117,3 +117,13 @@ def test_cancel_race_with_completion_is_consistent(queue):
     assert set(states) <= {JobState.SUCCEEDED, JobState.CANCELLED}
     # 每个任务处于且仅处于一个终态, 存储中无 leased/pending 残留
     assert queue.store.count_active() == 0
+    # 不变量: 取消一旦受理就必须收口 CANCELLED, 受理后不得再出现成功记录。
+    for j in jobs:
+        kinds = [e.event for e in queue.events(j.id)]
+        if EventType.CANCEL_REQUESTED in kinds:
+            fresh = queue.get(j.id)
+            assert fresh.state == JobState.CANCELLED
+            assert fresh.result is None
+            assert kinds[kinds.index(EventType.CANCEL_REQUESTED) + 1:] == [
+                EventType.CANCELLED
+            ]

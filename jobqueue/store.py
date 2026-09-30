@@ -250,13 +250,19 @@ class SQLiteStore:
             return claimed
 
     def complete(self, job_id: str, lease_token: str, result: object) -> bool:
-        """仅当租约仍由该执行者持有时置为成功。"""
+        """仅当租约仍由该执行者持有且取消未被受理时置为成功。
+
+        取消一旦受理(cancel_requested=1)就必须收口为 CANCELLED: 若取消恰好
+        卡在处理器返回与完成落库之间到达, 本写入被拒(返回 False), 由调用方
+        改走取消收口, 任务不会被改回成功、也不会带上处理器返回值。
+        """
         now = Job.now()
         with self._lock, self._conn:
             cur = self._conn.execute(
                 """UPDATE jobs SET state = ?, result = ?, lease_token = NULL,
                        lease_expires_at = NULL, updated_at = ?
-                   WHERE id = ? AND state = ? AND lease_token = ?""",
+                   WHERE id = ? AND state = ? AND lease_token = ?
+                         AND cancel_requested = 0""",
                 (JobState.SUCCEEDED.value, json.dumps(result), now,
                  job_id, JobState.LEASED.value, lease_token),
             )

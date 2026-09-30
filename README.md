@@ -36,8 +36,14 @@ DEAD    --人工重放--> PENDING (attempts 归零, 失败历史保留)
   `state=cancelled, cancel_requested=false`); 已领取的任务先返回
   `state=leased, cancel_requested=true` 表示"取消已受理", 随后始终收口
   为 `CANCELLED`——无论处理器紧接着成功、抛错还是超时, 也无论取消是否
-  正好卡在完成/失败落库的边界: 条件 SQL(`AND cancel_requested=0`)保证
-  成功与取消只有一方生效, 不会改回成功、重试待执行或再次领取执行。
+  正好卡在完成/失败落库的边界。
+- **取消受理后必定收口为已取消**: `complete` 与 `fail` 的条件 SQL 都带
+  `AND cancel_requested=0` 前置条件。取消一旦受理, 处理器随后无论正常
+  返回、抛异常还是超时, 其结果落库都会被拒, 由执行者改走取消收口——
+  不会改回 `SUCCEEDED`、不保留处理器返回值、不重新排队、不进重试/死信;
+  取消与"执行刚好结束"卡在同一时间点时, 由单条条件 SQL 保证只有一方
+  生效(先落库者赢), 终态不飘。晚到的旧执行者(租约已失效)的写入同样
+  被拒, 无法把任务翻回成功。
 - 并发重复取消、对终态(`SUCCEEDED`/`CANCELLED`)或 `DEAD` 的取消都是
   幂等的: 不报错、不改变已有结果、不重复追加审计记录。
 - 所有迁移都是带前置条件的单条 SQL(`WHERE state=? AND lease_token=?`),
@@ -147,6 +153,7 @@ curl 'localhost:8000/events?since_id=0&limit=200'  # 全局增量审计
 
 ```bash
 uv run pytest tests/ -q
+uv run pytest tests/test_cancel_consistency.py -q   # 只跑取消一致性/完成边界竞态用例
 ```
 
 - `test_submission.py`  幂等提交、幂等冲突、背压拒绝、取消幂等
@@ -160,7 +167,17 @@ uv run pytest tests/ -q
   未到期不收回的边界、旧执行者晚到写入被拒、重复扫描幂等
 - `test_cancel_consistency.py`  取消对成功/异常/超时/完成边界竞态始终
   收口 CANCELLED、并发重复取消只受理一次、终态取消无副作用、
-  排队/执行中返回语义可区分
+  排队/执行中返回语义可区分; 完成边界竞态的复现与验证:
+  - `test_complete_rejected_after_cancel_accepted_store_level`
+    确定性复现"取消受理后迟到的 complete 把任务改回成功"(存储层:
+    领取 → 取消受理 → complete 必须被拒);
+  - `test_cancel_in_completion_window_handler_{success,error,timeout}`
+    用 `CancelInjectingStore` 把取消精确注入"处理器已结束、结果未落库"
+    的窗口, 覆盖成功/异常/超时三种结局, 断言终态只能是 CANCELLED、
+    不留结果、不重试、不进死信;
+  - `test_accepted_cancel_never_succeeds_under_concurrency`
+    真实并发取消下, 凡审计中出现 `cancel_requested` 的任务终态必须是
+    CANCELLED 且无 `succeeded` 记录。
 - `test_audit.py`  完整生命周期事件序列、重启不丢、历史不被后续操作
   改写、触发器禁止 UPDATE/DELETE、不泄露载荷与堆栈、全局增量有序翻页
 

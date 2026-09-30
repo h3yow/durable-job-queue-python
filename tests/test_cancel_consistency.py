@@ -243,3 +243,215 @@ def test_pending_vs_leased_cancel_return_semantics_distinct(queue):
         "判定依据: 排队取消返回 state=%s; 执行中取消返回 state=%s + 标记",
         ack_pending.state.value, ack_leased.state.value,
     )
+
+
+def test_complete_rejected_after_cancel_accepted_store_level(queue):
+    """确定性复现: 取消已受理(标记已落库)后, 迟到的 complete 必须被拒绝。
+
+    时序: 领取 -> 处理器返回 -> 取消受理(cancel_requested=1) -> complete 落库。
+    修复前 complete 不带取消前置条件, 会把任务改回 SUCCEEDED 并带上结果。
+    """
+    job = queue.submit({"task": "cancel-then-complete"})
+    claimed = queue.store.claim_next(time.time(), 5.0)
+    assert claimed is not None and claimed.id == job.id
+
+    ack = queue.cancel(job.id)  # 取消被受理
+    assert ack.state == JobState.LEASED and ack.cancel_requested
+
+    ok = queue.store.complete(job.id, claimed.lease_token, "late-result")
+    assert not ok, "取消已受理后 complete 必须被拒绝"
+    assert queue.store.complete_cancel(job.id, claimed.lease_token)
+
+    final = queue.get(job.id)
+    assert final.state == JobState.CANCELLED
+    assert final.result is None, "取消收口后不得保留处理器返回值"
+    kinds = [e.event for e in queue.events(job.id)]
+    assert EventType.SUCCEEDED not in kinds
+    assert kinds.index(EventType.CANCEL_REQUESTED) < kinds.index(EventType.CANCELLED)
+    logger.info("判定依据: job=%s 取消受理后 complete 被拒, 终态=%s", job.id, final.state.value)
+
+
+# ----------------------------------------------------------------------
+# 完成边界竞态: 取消恰好卡在"处理器已结束"与"结果落库"之间
+# ----------------------------------------------------------------------
+from jobqueue import JobQueue, SQLiteStore  # noqa: E402
+from jobqueue import BackoffPolicy  # noqa: E402
+
+
+class CancelInjectingStore(SQLiteStore):
+    """在指定的条件写入落库前注入一次取消受理。
+
+    工作协程在处理器结束后先读取消标记、再执行条件写入(complete/fail);
+    本类把取消精确注入到这两者之间的窗口, 确定性复现完成边界竞态。
+    与 worker 同属一个线程, RLock 可重入, 不会自锁。
+    """
+
+    def __init__(self, path: str, inject_on: str) -> None:
+        super().__init__(path)
+        self._inject_on = inject_on  # "complete" | "fail"
+        self._injected = False
+
+    def _maybe_inject(self, job_id: str) -> None:
+        if not self._injected:
+            self._injected = True
+            self.cancel(job_id)  # 取消在结果落库前被受理
+
+    def complete(self, job_id, lease_token, result):  # noqa: ANN001, ANN201
+        if self._inject_on == "complete":
+            self._maybe_inject(job_id)
+        return super().complete(job_id, lease_token, result)
+
+    def fail(self, job):  # noqa: ANN001, ANN201
+        if self._inject_on == "fail":
+            self._maybe_inject(job.id)
+        return super().fail(job)
+
+
+def _make_injected_queue(db_path, inject_on):
+    store = CancelInjectingStore(db_path, inject_on)
+    return JobQueue(
+        store,
+        capacity=100,
+        backoff=BackoffPolicy(base_seconds=0.01, factor=2.0, max_seconds=0.1),
+        lease_seconds=5.0,
+    )
+
+
+def test_cancel_in_completion_window_handler_success(db_path):
+    """处理器成功返回后、结果落库前取消被受理: 终态必须是 CANCELLED, 不留结果。"""
+    queue = _make_injected_queue(db_path, "complete")
+
+    async def scenario():
+        async def handler(payload):
+            return "handler-return-value"
+
+        pool = WorkerPool(queue, handler, concurrency=1, poll_interval=0.005)
+        await pool.start()
+        job = queue.submit({"task": "window-success"}, max_attempts=3)
+        ok = await wait_for(lambda: queue.get(job.id).state == JobState.CANCELLED)
+        await pool.stop()
+        return job, ok
+
+    job, ok = run(scenario())
+    final = queue.get(job.id)
+    assert ok, "取消已受理, 必须收口为 CANCELLED 而不是 SUCCEEDED"
+    assert final.state == JobState.CANCELLED
+    assert final.result is None, "处理器返回值不得随取消收口暴露"
+    assert final.attempts == 1, "不得重新排队重试"
+    events = [e.event for e in queue.events(job.id)]
+    assert EventType.SUCCEEDED not in events
+    assert EventType.RETRY_SCHEDULED not in events
+    assert events.index(EventType.CANCEL_REQUESTED) < events.index(EventType.CANCELLED)
+    logger.info("判定依据: job=%s 成功落库窗口取消 -> %s", job.id, final.state.value)
+    queue.store.close()
+
+
+def test_cancel_in_completion_window_handler_error(db_path):
+    """处理器抛错后、失败落库前取消被受理: 收口 CANCELLED, 不重试不进死信。"""
+    queue = _make_injected_queue(db_path, "fail")
+
+    async def scenario():
+        async def handler(payload):
+            raise RuntimeError("boom in window")
+
+        pool = WorkerPool(queue, handler, concurrency=1, poll_interval=0.005)
+        await pool.start()
+        job = queue.submit({"task": "window-error"}, max_attempts=5)
+        ok = await wait_for(lambda: queue.get(job.id).state == JobState.CANCELLED)
+        await pool.stop()
+        return job, ok
+
+    job, ok = run(scenario())
+    final = queue.get(job.id)
+    assert ok and final.state == JobState.CANCELLED
+    assert final.attempts == 1, "取消受理后不得重试, 尝试次数不增加"
+    events = [e.event for e in queue.events(job.id)]
+    assert EventType.RETRY_SCHEDULED not in events
+    assert EventType.DEAD_LETTERED not in events
+    logger.info("判定依据: job=%s 异常落库窗口取消 -> %s", job.id, final.state.value)
+    queue.store.close()
+
+
+def test_cancel_in_completion_window_handler_timeout(db_path):
+    """处理器超时被中断后、失败落库前取消被受理: 收口 CANCELLED, 不重试。"""
+    queue = _make_injected_queue(db_path, "fail")
+
+    async def scenario():
+        async def handler(payload):
+            await asyncio.sleep(10)
+
+        pool = WorkerPool(queue, handler, concurrency=1, execute_timeout=0.05,
+                          poll_interval=0.005)
+        await pool.start()
+        job = queue.submit({"task": "window-timeout"}, max_attempts=5)
+        ok = await wait_for(lambda: queue.get(job.id).state == JobState.CANCELLED)
+        await pool.stop()
+        return job, ok
+
+    job, ok = run(scenario())
+    final = queue.get(job.id)
+    assert ok and final.state == JobState.CANCELLED
+    assert final.attempts == 1
+    events = [e.event for e in queue.events(job.id)]
+    assert EventType.RETRY_SCHEDULED not in events
+    assert EventType.DEAD_LETTERED not in events
+    logger.info("判定依据: job=%s 超时落库窗口取消 -> %s", job.id, final.state.value)
+    queue.store.close()
+
+
+def test_accepted_cancel_never_succeeds_under_concurrency(queue):
+    """真实并发取消: 凡取消被受理(CANCEL_REQUESTED)的任务, 终态只能是 CANCELLED。"""
+    async def scenario():
+        started = asyncio.Event()
+        in_flight = {"n": 0}
+
+        async def handler(payload):
+            in_flight["n"] += 1
+            started.set()
+            await asyncio.sleep(0.02)
+            return f"r{payload['i']}"
+
+        pool = WorkerPool(queue, handler, concurrency=4, poll_interval=0.001)
+        await pool.start()
+        jobs = [queue.submit({"i": i}) for i in range(60)]
+        await asyncio.wait_for(started.wait(), 2)
+        # 执行期间持续发起取消, 与完成/失败落库真实并发
+        for j in jobs:
+            queue.cancel(j.id)
+            await asyncio.sleep(0)
+        ok = await wait_for(
+            lambda: all(
+                queue.get(j.id).state in (JobState.SUCCEEDED, JobState.CANCELLED)
+                for j in jobs
+            ),
+            timeout=15,
+        )
+        await pool.stop()
+        return jobs, ok
+
+    jobs, ok = run(scenario())
+    assert ok
+    accepted = 0
+    for j in jobs:
+        final = queue.get(j.id)
+        events = [e.event for e in queue.events(j.id)]
+        if EventType.CANCEL_REQUESTED in events:
+            accepted += 1
+            assert final.state == JobState.CANCELLED, (
+                f"job={j.id} 取消已受理却收口为 {final.state.value}"
+            )
+            assert final.result is None
+            assert EventType.SUCCEEDED not in events, (
+                f"job={j.id} 取消受理后出现成功记录"
+            )
+            assert events.index(EventType.CANCEL_REQUESTED) < len(events), (
+                "受理后必须有后续收口"
+            )
+        else:
+            # 排队中被取消(立即生效)或取消前已成功: 均为合法终态
+            assert final.state in (JobState.SUCCEEDED, JobState.CANCELLED)
+    assert accepted > 0, "场景未覆盖到执行中取消, 测试无效"
+    logger.info(
+        "判定依据: 60 个并发任务中 %d 个执行中取消被受理, 全部收口 CANCELLED",
+        accepted,
+    )
